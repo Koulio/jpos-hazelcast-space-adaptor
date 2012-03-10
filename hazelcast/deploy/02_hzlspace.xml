@@ -1,5 +1,0 @@
-<hzlspace class="org.jpos.space.HzlSpaceAdaptor" logger="Q2">
- <property name="space-name"  value="hzl:Space" />
- <property name="configFile"  value="cfg/hazelcast.xml" />
-</hzlspace>
-
