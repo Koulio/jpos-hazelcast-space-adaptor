@@ -24,9 +24,7 @@ public class HzlSpaceAdaptor extends QBeanSupport {
     public void initService() throws ConfigurationException {
         Element e = getPersist();
         spaceUri = cfg.get("space-name", "hzl:DefaultSpace");
-        String configFile = cfg.get("configFile", null);
-        sp = configFile == null ? new HzlSpace(spaceUri) : new HzlSpace(configFile);
-        //sp.setLogger(getLog().getLogger(), getName());
+        sp = new HzlSpace(cfg);
         NameRegistrar.register(spaceUri, sp);
     }
 
@@ -43,4 +41,3 @@ public class HzlSpaceAdaptor extends QBeanSupport {
         NameRegistrar.unregister(spaceUri);
     }
 }
-

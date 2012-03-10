@@ -22,17 +22,23 @@
 package org.jpos.space;
 
 import java.io.FileNotFoundException;
+import java.io.NotSerializableException;
 import java.io.PrintStream;
 import java.util.Set;
 import java.util.LinkedList;
 import java.util.*;
 import java.io.Serializable;
 
+import com.hazelcast.client.ClientConfig;
+import com.hazelcast.client.HazelcastClient;
+import com.hazelcast.config.Config;
+import com.hazelcast.config.GroupConfig;
 import com.hazelcast.config.XmlConfigBuilder;
+import com.hazelcast.nio.Serializer.DataSerializer;
 import com.hazelcast.core.*;
 
 import org.jpos.util.Loggeable;
-
+import org.jpos.core.Configuration;
 import java.util.concurrent.*;
 
 
@@ -44,7 +50,18 @@ import java.util.concurrent.*;
  */
 
 public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
-    private HazelcastInstance instance;
+    private volatile HazelcastInstance instance;
+    private volatile HazelcastClient client;
+    private DataSerializer serializer = new DataSerializer();
+    private String hzlConfigFile;
+    private String spaceName;
+    private String clusterName;
+    private String clusterPassword;
+    private boolean useShuffle;
+    private String clusterIPs;
+    protected Configuration cfg;
+    protected Config hzlConfig;
+    protected TSpace<K,V> liveObjectSpace = new TSpace<K,V>();
     protected IMap<Object, LinkedList<Object>> entries;
     protected HzlSpace sl;    // space listeners
     protected IList<Set> expirables;
@@ -52,59 +69,134 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     public static final long GCDELAY = 60 * 1000;
     private static final long GCLONG = GCDELAY * 5;
     private long lastLongGC = System.currentTimeMillis();
+    public boolean clientOnly = false;
+
+
+    public HzlSpace(String spaceName) {
+        createSpace(spaceName, "");
+    }
 
     public HzlSpace(String spaceName, String configFile) {
         createSpace(spaceName, configFile);
     }
 
-    public HzlSpace(String spaceName) {
-        createSpace(spaceName, "");
-
+    public HzlSpace(Configuration cfg) {
+        this.cfg = cfg;
+        this.spaceName = cfg.get("space-name", "hzl:DefaultSpace");
+        this.clientOnly = cfg.getBoolean("clientOnly", false);
+        if (this.clientOnly) {
+            createClient(this.cfg);
+        }  else {
+            createSpace(spaceName, "");
+        }
     }
 
     public HzlSpace() {
         createSpace("hzl:DefaultSpace", "");
+    }
 
+    public void setHazelcastInstance(HazelcastInstance instance) {
+        this.instance = instance;
+    }
+
+    private void createClient(Configuration cfg) {
+        this.clusterName = this.cfg.get("clusterName");
+        this.clusterPassword = this.cfg.get("clusterPassword");
+        this.useShuffle = this.cfg.getBoolean("useShuffle", false);
+        this.clusterIPs = this.cfg.get("clusterIPs");
+        GroupConfig groupConf = new GroupConfig();
+        groupConf.setName(this.clusterName);
+        groupConf.setPassword(this.clusterPassword);
+
+        ClientConfig clientConf = new ClientConfig();
+        clientConf.setShuffle(this.useShuffle);
+        clientConf.addAddress(this.clusterIPs);
+        clientConf.setGroupConfig(groupConf);
+        clientConf.setReconnectionAttemptLimit(5);
+
+        this.client = HazelcastClient.newHazelcastClient(clientConf);
+        entries = this.client.getMap(spaceName);
+        expirables = this.client.getList(spaceName + "-expirables");
     }
 
     private void createSpace(String spaceName, String configFile) {
-        try {
-            if (configFile.isEmpty()) {
-                this.instance = Hazelcast.getDefaultInstance();
-            } else {
-                this.instance = Hazelcast.newHazelcastInstance(new XmlConfigBuilder(configFile).build());
-            }
 
-            entries = Hazelcast.getMap(spaceName);
-            expirables = Hazelcast.getList(spaceName + "-" + "expirables");
-        } catch (FileNotFoundException e) {
-            throw new SpaceError(e);
+        if (configFile != null && !configFile.isEmpty()) {
+            this.hzlConfigFile = configFile;
+        } else {
+            if (this.cfg != null) {
+                this.hzlConfigFile = cfg.get("hzlConfigFile", "");
+            }
         }
+
+        if (this.hzlConfigFile != null && !this.hzlConfigFile.isEmpty()) {
+            try {
+                this.hzlConfig = new XmlConfigBuilder(this.hzlConfigFile).build();
+            } catch (FileNotFoundException e) {
+                throw new SpaceError(e);
+            }
+        }
+
+        try {
+            if (this.cfg != null && this.hzlConfig != null) {
+                this.instance = Hazelcast.init(this.hzlConfig);
+            } else {
+                this.instance = Hazelcast.getDefaultInstance();
+            }
+            entries = this.instance.getMap(spaceName);
+            expirables = this.instance.getList(spaceName + "-expirables");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        entries = this.instance.getMap(spaceName);
+        expirables = this.instance.getList(spaceName + "-expirables");
+
         expirables.add(new HashSet<K>());
         expirables.add(new HashSet<K>());
+
         cleanupScheduler = Executors.newScheduledThreadPool(1);
     }
 
-    public void out (K key, V value) {
+    public boolean isLiveObject(Object obj) {
+        return !this.serializer.isSuitable(obj);
+
+    }
+
+    public void out(K key, V value) {
         if (key == null || value == null)
-            throw new NullPointerException ("key=" + key + ", value=" + value);
-        synchronized(this) {
-            getList (key).add (value);
-            this.notifyAll ();
+            throw new NullPointerException("key=" + key + ", value=" + value);
+        synchronized (this) {
+            if (isLiveObject(value)) {
+                liveObjectSpace.out(key, value);
+                value = (V)new LiveObject(key, value);
+            }
+            LinkedList<Object> l = entries.get(key);
+            if (l == null) l = new LinkedList<Object>();
+            l.add(value);
+            entries.put(key, l);
+            this.notifyAll();
             if (sl != null)
                 notifyListeners(key, value);
         }
     }
-    public void out (K key, V value, long timeout) {
+
+    public void out(K key, V value, long timeout) {
         if (key == null || value == null)
-            throw new NullPointerException ("key=" + key + ", value=" + value);
+            throw new NullPointerException("key=" + key + ", value=" + value);
         Object v = value;
         if (timeout > 0) {
-            v = new Expirable (value, System.currentTimeMillis() + timeout);
+            v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
         synchronized (this) {
-            getList (key).add (v);
-            this.notifyAll ();
+            if (isLiveObject(value)) {
+                liveObjectSpace.out(key, value, timeout);
+                value = (V)new LiveObject(key, value);
+            }
+            LinkedList<Object> l = entries.get(key);
+            if (l == null) l = new LinkedList<Object>();
+            l.add(v);
+            entries.put(key, l);
+            this.notifyAll();
             if (sl != null)
                 notifyListeners(key, value);
             if (timeout > 0) {
@@ -113,19 +205,33 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         }
     }
 
-    public V rdp(Object key) {
+    public synchronized V rdp(Object key) {
+        Object v = null;
         if (key instanceof Template)
-            return (V) getObject((Template) key, false);
-        return (V) getHead(key, false);
+            v = getObject((Template) key, false);
+        else
+            v = getHead(key, false);
+
+        if (v instanceof LiveObject)
+            v = liveObjectSpace.rdp(key);
+
+        return (V)v;
     }
 
-    public V inp(Object key) {
+    public synchronized V inp(Object key) {
+        Object v = null;
         if (key instanceof Template)
-            return (V) getObject((Template) key, true);
-        return (V) getHead(key, true);
+            v = getObject((Template) key, true);
+        else
+            v = getHead(key, true);
+
+        if (v instanceof LiveObject)
+            v = liveObjectSpace.inp(key);
+
+        return (V)v;
     }
 
-    public V in(Object key) {
+    public synchronized V in(Object key) {
         Object obj;
         while ((obj = inp(key)) == null) {
             try {
@@ -136,7 +242,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return (V) obj;
     }
 
-    public V in(Object key, long timeout) {
+    public synchronized V in(Object key, long timeout) {
         Object obj;
         long now = System.currentTimeMillis();
         long end = now + timeout;
@@ -150,7 +256,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return (V) obj;
     }
 
-    public V rd(Object key) {
+    public synchronized V rd(Object key) {
         Object obj;
         while ((obj = rdp(key)) == null) {
             try {
@@ -161,7 +267,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return (V) obj;
     }
 
-    public V rd(Object key, long timeout) {
+    public synchronized V rd(Object key, long timeout) {
         Object obj;
         long now = System.currentTimeMillis();
         long end = now + timeout;
@@ -175,7 +281,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return (V) obj;
     }
 
-    public int size(Object key) {
+    public synchronized int size(Object key) {
         int size = 0;
         LinkedList<Object> l = entries.get(key);
         if (l != null)
@@ -183,16 +289,16 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return size;
     }
 
-    public void addListener(Object key, SpaceListener listener) {
+    public synchronized void addListener(Object key, SpaceListener listener) {
         getSL().out(key, listener);
     }
 
-    public void addListener
+    public synchronized void addListener
             (Object key, SpaceListener listener, long timeout) {
         getSL().out(key, listener, timeout);
     }
 
-    public void removeListener
+    public synchronized void removeListener
             (Object key, SpaceListener listener) {
         if (sl != null) {
             sl.inp(new ObjectTemplate(key, listener));
@@ -211,7 +317,9 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         StringBuffer sb = new StringBuffer();
         Object[] keys;
 
-        keys = entries.keySet().toArray();
+        synchronized (this) {
+            keys = entries.keySet().toArray();
+        }
 
         for (int i = 0; i < keys.length; i++) {
             if (i > 0)
@@ -223,26 +331,32 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
 
     public void dump(PrintStream p, String indent) {
         Object[] keys;
-        keys = entries.keySet().toArray();
+        synchronized (this) {
+            keys = entries.keySet().toArray();
+        }
 
         for (int i = 0; i < keys.length; i++) {
             p.printf("%s<key count='%d'>%s</key>\n", indent, size(keys[i]), keys[i]);
         }
-        p.println(indent + "<keycount>" + (keys.length - 1) + "</keycount>");
+        p.println(indent + "<keycount>" + (keys.length) + "</keycount>");
         int exp0, exp1;
-        exp0 = expirables.get(0).size();
-        exp1 = expirables.get(1).size();
+        synchronized (this) {
+            exp0 = expirables.get(0).size();
+            exp1 = expirables.get(1).size();
+        }
         p.println(String.format("%s<gcinfo>%d,%d</gcinfo>\n", indent, exp0, exp1));
     }
 
     public void notifyListeners(Object key, Object value) {
         Object[] listeners = null;
-        if (sl == null)
-            return;
-        LinkedList<Object> l = (LinkedList<Object>) sl.entries.get(key);
-        if (l != null)
-            listeners = l.toArray();
 
+        synchronized (this) {
+            if (sl == null)
+                return;
+            LinkedList<Object> l = (LinkedList<Object>) sl.entries.get(key);
+            if (l != null)
+                listeners = l.toArray();
+        }
         if (listeners != null) {
             for (int i = 0; i < listeners.length; i++) {
                 Object o = listeners[i];
@@ -257,11 +371,19 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     public void push(K key, V value) {
         if (key == null || value == null)
             throw new NullPointerException("key=" + key + ", value=" + value);
-
-        getList(key).add(0, value);
-        this.notifyAll();
-        if (sl != null)
-            notifyListeners(key, value);
+        synchronized (this) {
+            if (isLiveObject(value)) {
+                liveObjectSpace.push(key, value);
+                value = (V)new LiveObject(key, value);
+            }
+            LinkedList<Object> l = entries.get(key);
+            if (l == null) l = new LinkedList<Object>();
+            l.add(value);
+            entries.put(0, l);
+            this.notifyAll();
+            if (sl != null)
+                notifyListeners(key, value);
+        }
     }
 
     public void push(K key, V value, long timeout) {
@@ -271,23 +393,35 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (timeout > 0) {
             v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
-
-        getList(key).add(0, v);
-        this.notifyAll();
-        if (sl != null)
-            notifyListeners(key, value);
-        if (timeout > 0) {
-            registerExpirable(key, timeout);
+        synchronized (this) {
+            if (isLiveObject(value)) {
+                liveObjectSpace.push(key, value, timeout);
+                value = (V)new LiveObject(key, value);
+            }
+            LinkedList<Object> l = entries.get(key);
+            if (l == null) l = new LinkedList<Object>();
+            l.add(v);
+            entries.put(key, l);
+            this.notifyAll();
+            if (sl != null)
+                notifyListeners(key, value);
+            if (timeout > 0) {
+                registerExpirable(key, timeout);
+            }
         }
     }
 
-    public void put(K key, V value) {
+    public synchronized void put(K key, V value) {
         if (key == null || value == null)
             throw new NullPointerException("key=" + key + ", value=" + value);
 
+        if (isLiveObject(value)) {
+            liveObjectSpace.put(key, value);
+            value = (V)new LiveObject(key, value);
+        }
         LinkedList<Object> l = new LinkedList<Object>();
         l.add(value);
-        entries.put((Object) key, l);
+        entries.put((Object)key, l);
         this.notifyAll();
         if (sl != null)
             notifyListeners(key, value);
@@ -300,14 +434,20 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (timeout > 0) {
             v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
-        LinkedList<Object> l = new LinkedList<Object>();
-        l.add(v);
-        entries.put(key, l);
-        this.notifyAll();
-        if (sl != null)
-            notifyListeners(key, value);
-        if (timeout > 0) {
-            registerExpirable(key, timeout);
+        synchronized (this) {
+            if (isLiveObject(value)) {
+                liveObjectSpace.put(key, value, timeout);
+                value = (V)new LiveObject(key, value);
+            }
+            LinkedList<Object> l = new LinkedList<Object>();
+            l.add(v);
+            entries.put(key, l);
+            this.notifyAll();
+            if (sl != null)
+                notifyListeners(key, value);
+            if (timeout > 0) {
+                registerExpirable(key, timeout);
+            }
         }
     }
 
@@ -343,11 +483,19 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         this.entries = entries;
     }
 
-    private LinkedList<Object> getList(Object key) {
-        LinkedList<Object> l = entries.get(key);
-        if (l == null)
-            entries.put(key, l = new LinkedList<Object>());
-        return l;
+    protected static class LiveObject implements Serializable{
+        Object localKey;
+        Object distributedKey;
+        Object distributedValue;
+        Object liveValue;
+
+        public LiveObject(Object key, Object value) {
+            super();
+            this.localKey = key;
+            this.distributedKey = key;
+            this.liveValue = value;
+            this.distributedValue = this.localKey;
+        }
     }
 
     private Object getHead(Object key, boolean remove) {
@@ -396,35 +544,41 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     protected class ExpirationService implements Serializable, Runnable {
 
         public ExpirationService() {
-            cleanupScheduler.scheduleAtFixedRate(this, GCDELAY, GCDELAY,TimeUnit.MILLISECONDS);
+            cleanupScheduler.scheduleAtFixedRate(this, GCDELAY, GCDELAY, TimeUnit.MILLISECONDS);
         }
 
-        public void run () {
+        public void run() {
             try {
                 gc();
             } catch (Exception e) {
                 e.printStackTrace(); // this should never happen
             }
         }
-        public void gc () {
+
+        public void gc() {
             gc(0);
             if (System.currentTimeMillis() - lastLongGC > GCLONG) {
                 gc(1);
                 lastLongGC = System.currentTimeMillis();
             }
         }
-        private void gc (int generation) {
+
+        private void gc(int generation) {
             Set<K> exps = expirables.get(generation);
-            expirables.set(generation, new HashSet<K>());
+            synchronized (this) {
+                expirables.set(generation, new HashSet<K>());
+            }
 
             for (K k : exps) {
                 if (rdp(k) != null) {
                     unregisterExpirable(k);
-                    expirables.get(generation).add(k);
-                }  else {
+                    synchronized (this) {
+                        expirables.get(generation).add(k);
+                    }
+                } else {
                     entries.remove(k);
                 }
-                Thread.yield ();
+                Thread.yield();
             }
             if (sl != null) {
                 synchronized (this) {
