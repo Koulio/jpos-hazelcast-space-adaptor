@@ -309,7 +309,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                 @Override
                 public Integer call() throws Exception {
                     int n = 0;
-                    LinkedList<Object> l = entries.get(key);
+                    LinkedList<Object> l = map.get(key);
                     if (l != null)
                         n = l.size();
                     return n;
