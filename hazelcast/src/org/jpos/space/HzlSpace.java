@@ -22,7 +22,6 @@
 package org.jpos.space;
 
 import java.io.FileNotFoundException;
-import java.io.NotSerializableException;
 import java.io.PrintStream;
 import java.util.Set;
 import java.util.LinkedList;
@@ -50,9 +49,8 @@ import java.util.concurrent.*;
  */
 
 public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
-    private volatile HazelcastInstance instance;
-    private volatile HazelcastClient client;
-    private DataSerializer serializer = new DataSerializer();
+    private volatile HazelcastInstance instance = null;
+    private volatile HazelcastClient client = null;
     private String hzlConfigFile;
     private String spaceName;
     private String clusterName;
@@ -143,8 +141,6 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             } else {
                 this.instance = Hazelcast.getDefaultInstance();
             }
-            entries = this.instance.getMap(spaceName);
-            expirables = this.instance.getList(spaceName + "-expirables");
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -157,16 +153,11 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         cleanupScheduler = Executors.newScheduledThreadPool(1);
     }
 
-    public boolean isLiveObject(Object obj) {
-        return !this.serializer.isSuitable(obj);
-
-    }
-
     public void out(K key, V value) {
         if (key == null || value == null)
             throw new NullPointerException("key=" + key + ", value=" + value);
         synchronized (this) {
-            if (isLiveObject(value)) {
+            if (LiveObject.isLiveObject(value)) {
                 liveObjectSpace.out(key, value);
                 value = (V)new LiveObject(key, value);
             }
@@ -188,7 +179,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
         synchronized (this) {
-            if (isLiveObject(value)) {
+            if (LiveObject.isLiveObject(value)) {
                 liveObjectSpace.out(key, value, timeout);
                 value = (V)new LiveObject(key, value);
             }
@@ -309,6 +300,24 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return entries.isEmpty();
     }
 
+    public int getDistributedSize(final IList<Set> list, final int index) {
+        int size = 0;
+        try {
+            ExecutorService es = Hazelcast.getExecutorService();
+            Future<Integer> task = es.submit(new Callable<Integer>() {
+                @Override
+                public Integer call() throws Exception {
+                    return list.get(index).size();
+                }
+            });
+            size = task.get(); 
+        } catch (Exception e) {
+           e.printStackTrace();
+        }
+
+        return size;
+    }
+
     public Set getKeySet() {
         return entries.keySet();
     }
@@ -341,8 +350,13 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         p.println(indent + "<keycount>" + (keys.length) + "</keycount>");
         int exp0, exp1;
         synchronized (this) {
-            exp0 = expirables.get(0).size();
-            exp1 = expirables.get(1).size();
+            if (this.client != null) {
+                exp0 = getDistributedSize(expirables, 0);
+                exp1 = getDistributedSize(expirables, 1);
+            } else {
+                exp0 = expirables.get(0).size();
+                exp1 = expirables.get(1).size();
+            }
         }
         p.println(String.format("%s<gcinfo>%d,%d</gcinfo>\n", indent, exp0, exp1));
     }
@@ -372,7 +386,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (key == null || value == null)
             throw new NullPointerException("key=" + key + ", value=" + value);
         synchronized (this) {
-            if (isLiveObject(value)) {
+            if (LiveObject.isLiveObject(value)) {
                 liveObjectSpace.push(key, value);
                 value = (V)new LiveObject(key, value);
             }
@@ -394,7 +408,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
         synchronized (this) {
-            if (isLiveObject(value)) {
+            if (LiveObject.isLiveObject(value)) {
                 liveObjectSpace.push(key, value, timeout);
                 value = (V)new LiveObject(key, value);
             }
@@ -415,7 +429,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (key == null || value == null)
             throw new NullPointerException("key=" + key + ", value=" + value);
 
-        if (isLiveObject(value)) {
+        if (LiveObject.isLiveObject(value)) {
             liveObjectSpace.put(key, value);
             value = (V)new LiveObject(key, value);
         }
@@ -435,7 +449,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
         synchronized (this) {
-            if (isLiveObject(value)) {
+            if (LiveObject.isLiveObject(value)) {
                 liveObjectSpace.put(key, value, timeout);
                 value = (V)new LiveObject(key, value);
             }
@@ -484,10 +498,11 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     }
 
     protected static class LiveObject implements Serializable{
-        Object localKey;
-        Object distributedKey;
-        Object distributedValue;
-        Object liveValue;
+        public Object localKey;
+        public Object distributedKey;
+        public Object distributedValue;
+        public Object liveValue;
+        private static DataSerializer serializer = new DataSerializer();
 
         public LiveObject(Object key, Object value) {
             super();
@@ -495,6 +510,14 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             this.distributedKey = key;
             this.liveValue = value;
             this.distributedValue = this.localKey;
+        }
+
+        public static boolean isLiveObject(Object obj) {
+            if (obj instanceof Serializable || serializer.isSuitable(obj)) {
+                return true;
+            }
+
+            return false;
         }
     }
 
