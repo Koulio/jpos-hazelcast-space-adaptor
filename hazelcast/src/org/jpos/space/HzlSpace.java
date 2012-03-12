@@ -300,6 +300,29 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return entries.isEmpty();
     }
 
+    public int getDistributedSize(final IMap<Object, LinkedList<Object>> map, final Object key) {
+        int size = 0;
+
+        try {
+            ExecutorService es = Hazelcast.getExecutorService();
+            Future<Integer> task = es.submit(new Callable<Integer>() {
+                @Override
+                public Integer call() throws Exception {
+                    int n = 0;
+                    LinkedList<Object> l = entries.get(key);
+                    if (l != null)
+                        n = l.size();
+                    return n;
+                }
+            });
+            size = task.get();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        return size;
+    }
+
     public int getDistributedSize(final IList<Set> list, final int index) {
         int size = 0;
         try {
@@ -345,7 +368,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         }
 
         for (int i = 0; i < keys.length; i++) {
-            p.printf("%s<key count='%d'>%s</key>\n", indent, size(keys[i]), keys[i]);
+            p.printf("%s<key count='%d'>%s</key>\n", indent, getDistributedSize(entries, i), keys[i]);
         }
         p.println(indent + "<keycount>" + (keys.length) + "</keycount>");
         int exp0, exp1;
