@@ -36,8 +36,10 @@ import com.hazelcast.config.XmlConfigBuilder;
 import com.hazelcast.nio.Serializer.DataSerializer;
 import com.hazelcast.core.*;
 
+import org.apache.commons.collections.map.SingletonMap;
 import org.jpos.util.Loggeable;
 import org.jpos.core.Configuration;
+
 import java.util.concurrent.*;
 
 
@@ -51,15 +53,12 @@ import java.util.concurrent.*;
 public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     private volatile HazelcastInstance instance = null;
     private volatile HazelcastClient client = null;
+    private DataSerializer serializer =  new DataSerializer();
     private String hzlConfigFile;
     private String spaceName;
-    private String clusterName;
-    private String clusterPassword;
-    private boolean useShuffle;
-    private String clusterIPs;
     protected Configuration cfg;
     protected Config hzlConfig;
-    protected TSpace<K,V> liveObjectSpace = new TSpace<K,V>();
+    protected TSpace<K, V> liveObjectSpace = new TSpace<K, V>();
     protected IMap<Object, LinkedList<Object>> entries;
     protected HzlSpace sl;    // space listeners
     protected IList<Set> expirables;
@@ -84,7 +83,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         this.clientOnly = cfg.getBoolean("clientOnly", false);
         if (this.clientOnly) {
             createClient(this.cfg);
-        }  else {
+        } else {
             createSpace(spaceName, "");
         }
     }
@@ -93,22 +92,18 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         createSpace("hzl:DefaultSpace", "");
     }
 
-    public void setHazelcastInstance(HazelcastInstance instance) {
-        this.instance = instance;
-    }
-
     private void createClient(Configuration cfg) {
-        this.clusterName = this.cfg.get("clusterName");
-        this.clusterPassword = this.cfg.get("clusterPassword");
-        this.useShuffle = this.cfg.getBoolean("useShuffle", false);
-        this.clusterIPs = this.cfg.get("clusterIPs");
+        String clusterName = this.cfg.get("clusterName");
+        String clusterPassword = this.cfg.get("clusterPassword");
+        Boolean useShuffle = this.cfg.getBoolean("useShuffle", false);
+        String clusterIPs = this.cfg.get("clusterIPs");
         GroupConfig groupConf = new GroupConfig();
-        groupConf.setName(this.clusterName);
-        groupConf.setPassword(this.clusterPassword);
+        groupConf.setName(clusterName);
+        groupConf.setPassword(clusterPassword);
 
         ClientConfig clientConf = new ClientConfig();
-        clientConf.setShuffle(this.useShuffle);
-        clientConf.addAddress(this.clusterIPs);
+        clientConf.setShuffle(useShuffle);
+        clientConf.addAddress(clusterIPs);
         clientConf.setGroupConfig(groupConf);
         clientConf.setReconnectionAttemptLimit(5);
 
@@ -130,6 +125,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (this.hzlConfigFile != null && !this.hzlConfigFile.isEmpty()) {
             try {
                 this.hzlConfig = new XmlConfigBuilder(this.hzlConfigFile).build();
+                this.hzlConfig.setLiteMember(cfg.getBoolean("liteMember", false));
             } catch (FileNotFoundException e) {
                 throw new SpaceError(e);
             }
@@ -157,9 +153,10 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (key == null || value == null)
             throw new NullPointerException("key=" + key + ", value=" + value);
         synchronized (this) {
-            if (LiveObject.isLiveObject(value)) {
+            if (isLiveObject(value)) {
                 liveObjectSpace.out(key, value);
-                value = (V)new LiveObject(key, value);
+                Map<String, K> k = new SingletonMap("localkey", key);
+                value = (V)k ;
             }
             LinkedList<Object> l = entries.get(key);
             if (l == null) l = new LinkedList<Object>();
@@ -179,9 +176,10 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
         synchronized (this) {
-            if (LiveObject.isLiveObject(value)) {
-                liveObjectSpace.out(key, value, timeout);
-                value = (V)new LiveObject(key, value);
+            if (isLiveObject(value)) {
+                liveObjectSpace.out(key, value);
+                Map<String, K> k = new SingletonMap("localkey", key);
+                value = (V)k ;
             }
             LinkedList<Object> l = entries.get(key);
             if (l == null) l = new LinkedList<Object>();
@@ -203,10 +201,10 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         else
             v = getHead(key, false);
 
-        if (v instanceof LiveObject)
+        if (v instanceof SingletonMap)
             v = liveObjectSpace.rdp(key);
 
-        return (V)v;
+        return (V) v;
     }
 
     public synchronized V inp(Object key) {
@@ -216,10 +214,10 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         else
             v = getHead(key, true);
 
-        if (v instanceof LiveObject)
+        if (v instanceof SingletonMap)
             v = liveObjectSpace.inp(key);
 
-        return (V)v;
+        return (V) v;
     }
 
     public synchronized V in(Object key) {
@@ -300,42 +298,76 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return entries.isEmpty();
     }
 
-    public int getDistributedSize(final IMap<Object, LinkedList<Object>> map, final Object key) {
-        int size = 0;
+    protected class DistributedSize implements Callable<Integer>, Serializable {
+        protected Object entity = null;
+        public Object key;
+        public String entityName;
+        public String entityType;
 
-        try {
-            ExecutorService es = Hazelcast.getExecutorService();
-            Future<Integer> task = es.submit(new Callable<Integer>() {
-                @Override
-                public Integer call() throws Exception {
-                    int n = 0;
-                    LinkedList<Object> l = map.get(key);
-                    if (l != null)
-                        n = l.size();
-                    return n;
-                }
-            });
-            size = task.get();
-        } catch (Exception e) {
-            e.printStackTrace();
+
+        public DistributedSize(String entityType, String entityName, Object key) {
+            this.entity = entity;
+            this.key = key;
+            this.entityType = entityType;
+
+            switch (this.entityType) {
+                case "IMap":
+                    this.entityName = ((IMap) entity).getName();
+                    break;
+                case "IList":
+                    this.entityName = ((IList) entity).getName();
+                    break;
+                default:
+                    break;
+            }
         }
 
-        return size;
+        public Integer call() {
+            int n = 0;
+            if (this.entity != null) {
+                switch (this.entityType) {
+                    case "IMap":
+                        IMap map = Hazelcast.getMap(this.entityName);
+                        LinkedList<Object> l = (LinkedList<Object>) map.get(this.key);
+                        if (l != null)
+                            n = l.size();
+                        break;
+                    case "IList":
+                        IList list = Hazelcast.getList(this.entityName);
+                        Set s = (Set) list.get((Integer) this.key);
+                        if (s != null)
+                            n = s.size();
+                        break;
+                    default:
+                        break;
+                }
+            }
+            return n;
+        }
     }
 
-    public int getDistributedSize(final IList<Set> list, final int index) {
+    public int getDistributedSize(Object entity, Object key) {
         int size = 0;
+        String entityName;
+        String entityType = entity.getClass().getName();
+        switch (entityType) {
+            case "IMap":
+                entityName = ((IMap) entity).getName();
+                break;
+            case "IList":
+                entityName = ((IList) entity).getName();
+                break;
+            default:
+                entityName = null;
+                break;
+        }
+
         try {
-            ExecutorService es = Hazelcast.getExecutorService();
-            Future<Integer> task = es.submit(new Callable<Integer>() {
-                @Override
-                public Integer call() throws Exception {
-                    return list.get(index).size();
-                }
-            });
-            size = task.get(); 
+            ExecutorService executorService = Executors.newSingleThreadExecutor();
+            Future<Integer> future = executorService.submit (new DistributedSize(entityType, entityName, key));
+            size = future.get();
         } catch (Exception e) {
-           e.printStackTrace();
+            e.printStackTrace();
         }
 
         return size;
@@ -368,7 +400,11 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         }
 
         for (int i = 0; i < keys.length; i++) {
-            p.printf("%s<key count='%d'>%s</key>\n", indent, getDistributedSize(entries, i), keys[i]);
+            if (this.client != null) {
+                p.printf("%s<key count='%d'>%s</key>\n", indent, getDistributedSize(entries, i), keys[i]);
+            } else {
+                p.printf("%s<key count='%d'>%s</key>\n", indent, size(keys[i]), keys[i]);
+            }
         }
         p.println(indent + "<keycount>" + (keys.length) + "</keycount>");
         int exp0, exp1;
@@ -409,9 +445,10 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (key == null || value == null)
             throw new NullPointerException("key=" + key + ", value=" + value);
         synchronized (this) {
-            if (LiveObject.isLiveObject(value)) {
+            if (isLiveObject(value)) {
                 liveObjectSpace.push(key, value);
-                value = (V)new LiveObject(key, value);
+                Map<String, K> k = new SingletonMap("localkey", key);
+                value = (V)k ;
             }
             LinkedList<Object> l = entries.get(key);
             if (l == null) l = new LinkedList<Object>();
@@ -431,9 +468,10 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
         synchronized (this) {
-            if (LiveObject.isLiveObject(value)) {
-                liveObjectSpace.push(key, value, timeout);
-                value = (V)new LiveObject(key, value);
+            if (isLiveObject(value)) {
+                liveObjectSpace.push(key, value);
+                Map<String, K> k = new SingletonMap("localkey", key);
+                value = (V)k ;
             }
             LinkedList<Object> l = entries.get(key);
             if (l == null) l = new LinkedList<Object>();
@@ -452,13 +490,14 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (key == null || value == null)
             throw new NullPointerException("key=" + key + ", value=" + value);
 
-        if (LiveObject.isLiveObject(value)) {
+        if (isLiveObject(value)) {
             liveObjectSpace.put(key, value);
-            value = (V)new LiveObject(key, value);
+            Map<String, K> k = new SingletonMap("localkey", key);
+            value = (V)k ;
         }
         LinkedList<Object> l = new LinkedList<Object>();
         l.add(value);
-        entries.put((Object)key, l);
+        entries.put((Object) key, l);
         this.notifyAll();
         if (sl != null)
             notifyListeners(key, value);
@@ -472,9 +511,10 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             v = new Expirable(value, System.currentTimeMillis() + timeout);
         }
         synchronized (this) {
-            if (LiveObject.isLiveObject(value)) {
-                liveObjectSpace.put(key, value, timeout);
-                value = (V)new LiveObject(key, value);
+            if (isLiveObject(value)) {
+                liveObjectSpace.put(key, value);
+                Map<String, K> k = new SingletonMap("localkey", key);
+                value = (V)k ;
             }
             LinkedList<Object> l = new LinkedList<Object>();
             l.add(v);
@@ -520,28 +560,12 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         this.entries = entries;
     }
 
-    protected static class LiveObject implements Serializable{
-        public Object localKey;
-        public Object distributedKey;
-        public Object distributedValue;
-        public Object liveValue;
-        private static DataSerializer serializer = new DataSerializer();
-
-        public LiveObject(Object key, Object value) {
-            super();
-            this.localKey = key;
-            this.distributedKey = key;
-            this.liveValue = value;
-            this.distributedValue = this.localKey;
-        }
-
-        public static boolean isLiveObject(Object obj) {
-            if (obj instanceof Serializable || serializer.isSuitable(obj)) {
-                return true;
-            }
-
+    public boolean isLiveObject(Object obj) {
+        if (obj instanceof Serializable || this.serializer.isSuitable((obj))) {
             return false;
         }
+
+        return true;
     }
 
     private Object getHead(Object key, boolean remove) {
