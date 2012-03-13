@@ -63,6 +63,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     protected HzlSpace sl;    // space listeners
     protected IList<Set> expirables;
     protected ScheduledExecutorService cleanupScheduler;
+    protected ExecutorService executorService = Executors.newFixedThreadPool(5);
     public static final long GCDELAY = 60 * 1000;
     private static final long GCLONG = GCDELAY * 5;
     private long lastLongGC = System.currentTimeMillis();
@@ -299,32 +300,22 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     }
 
     protected class DistributedSize implements Callable<Integer>, Serializable {
-        protected Object entity = null;
         public Object key;
         public String entityName;
         public String entityType;
 
 
         public DistributedSize(String entityType, String entityName, Object key) {
-            this.entity = entity;
             this.key = key;
+            this.entityName = entityName;
             this.entityType = entityType;
-
-            switch (this.entityType) {
-                case "IMap":
-                    this.entityName = ((IMap) entity).getName();
-                    break;
-                case "IList":
-                    this.entityName = ((IList) entity).getName();
-                    break;
-                default:
-                    break;
-            }
         }
 
         public Integer call() {
-            int n = 0;
-            if (this.entity != null) {
+            int n = -999;
+            System.out.print("name= " + entityName);
+            System.out.print("type= " + entityType);
+            if (this.entityType != null) {
                 switch (this.entityType) {
                     case "IMap":
                         IMap map = Hazelcast.getMap(this.entityName);
@@ -339,6 +330,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                             n = s.size();
                         break;
                     default:
+                        n = 0 ;
                         break;
                 }
             }
@@ -363,8 +355,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         }
 
         try {
-            ExecutorService executorService = Executors.newSingleThreadExecutor();
-            Future<Integer> future = executorService.submit (new DistributedSize(entityType, entityName, key));
+            Future<Integer> future = this.executorService.submit (new DistributedSize(entityType, entityName, key));
             size = future.get();
         } catch (Exception e) {
             e.printStackTrace();
