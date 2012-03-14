@@ -27,6 +27,8 @@ import java.util.Set;
 import java.util.LinkedList;
 import java.util.*;
 import java.io.Serializable;
+import java.lang.Integer.*;
+import java.lang.Long.*;
 
 import com.hazelcast.client.ClientConfig;
 import com.hazelcast.client.HazelcastClient;
@@ -63,7 +65,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     protected HzlSpace sl;    // space listeners
     protected IList<Set> expirables;
     protected ScheduledExecutorService cleanupScheduler;
-    protected ExecutorService executorService = Executors.newFixedThreadPool(5);
+    protected ExecutorService executorService;
     public static final long GCDELAY = 60 * 1000;
     private static final long GCLONG = GCDELAY * 5;
     private long lastLongGC = System.currentTimeMillis();
@@ -109,8 +111,8 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         clientConf.setReconnectionAttemptLimit(5);
 
         this.client = HazelcastClient.newHazelcastClient(clientConf);
-        entries = this.client.getMap(spaceName);
-        expirables = this.client.getList(spaceName + "-expirables");
+        this.entries = this.client.getMap(spaceName);
+        this.expirables = this.client.getList(spaceName + "-expirables");
     }
 
     private void createSpace(String spaceName, String configFile) {
@@ -141,13 +143,13 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         } catch (Exception e) {
             e.printStackTrace();
         }
-        entries = this.instance.getMap(spaceName);
-        expirables = this.instance.getList(spaceName + "-expirables");
+        this.entries = this.instance.getMap(spaceName);
+        this.expirables = this.instance.getList(spaceName + "-expirables");
 
-        expirables.add(new HashSet<K>());
-        expirables.add(new HashSet<K>());
-
-        cleanupScheduler = Executors.newScheduledThreadPool(1);
+        this.expirables.add(new HashSet<K>());
+        this.expirables.add(new HashSet<K>());
+        this.executorService = this.instance.getExecutorService();
+        this.cleanupScheduler = Executors.newScheduledThreadPool(1);
     }
 
     public void out(K key, V value) {
@@ -304,7 +306,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return entries.isEmpty();
     }
 
-    protected class DistributedSize implements Callable<Integer>, Serializable, HazelcastInstanceAware {
+    protected class DistributedSize<Integer> implements Callable<java.lang.Integer>, Serializable, HazelcastInstanceAware {
         public Object key;
         public String entityName;
         public String entityType;
@@ -320,9 +322,9 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             this.hazelcast = hazelcastInstance;
         }
 
-        public Integer call() {
-            int n = 0;
-
+        public java.lang.Integer call() {
+            int n;
+            n = 0;
             switch (this.entityType) {
                 case "com.hazelcast.client.MapClientProxy":
                     IMap map = this.hazelcast.getMap(this.entityName);
@@ -335,7 +337,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                 case "com.hazelcast.client.ListClientProxy":
                     IList list = this.hazelcast.getList(this.entityName);
                     if (list != null && this.key != null) {
-                        Set s = (Set) list.get((Integer)this.key);
+                        Set s = (Set) list.get(java.lang.Integer.parseInt((String) this.key));
                         if (s != null) 
                             n = s.size();
                     }
@@ -344,6 +346,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                     n = 0;
                     break;
             }
+            
             return n;
         }
     }
@@ -363,14 +366,14 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                 entityName = null;
                 break;
         }
-        if(entityName != null) {
+        if(entityName != null && entityType != null && key != null) {
             try {
-                Future<Integer> future = this.executorService.submit (new DistributedSize(entityType, entityName, key));
-                size = future.get();
+                Future<Integer> task = this.executorService.submit (new DistributedSize<Integer>(entityType, entityName, key));
+                size = task.get();
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }  catch (ExecutionException e){
-                //
+                e.printStackTrace();
             }
 
         }
@@ -412,7 +415,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
             }
         }
         p.println(indent + "<keycount>" + (keys.length) + "</keycount>");
-        int exp0, exp1;
+        long exp0, exp1;
         synchronized (this) {
             if (this.client != null) {
                 exp0 = getDistributedSize(expirables, 0);
