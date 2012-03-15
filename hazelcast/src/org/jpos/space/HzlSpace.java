@@ -338,7 +338,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                     IList list = this.hazelcast.getList(this.entityName);
                     if (list != null && this.key != null) {
                         Set s = (Set) list.get(java.lang.Integer.parseInt((String) this.key));
-                        if (s != null) 
+                        if (s != null)
                             n = s.size();
                     }
                     break;
@@ -346,7 +346,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                     n = 0;
                     break;
             }
-            
+
             return n;
         }
     }
@@ -366,12 +366,12 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                 entityName = null;
                 break;
         }
-        if(entityName != null && entityType != null && key != null) {
+        if(entityName != null && this.executorService != null) {
             try {
                 Future<Integer> task = this.executorService.submit (new DistributedSize<Integer>(entityType, entityName, key));
                 size = task.get();
             } catch (InterruptedException e) {
-                e.printStackTrace();
+                //e.printStackTrace();
             }  catch (ExecutionException e){
                 e.printStackTrace();
             }
@@ -580,7 +580,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
 
     private Object getHead(Object key, boolean remove) {
         Object obj = null;
-        LinkedList<Object> l = entries.get(key);
+        LinkedList<Object> l = this.entries.get(key);
         boolean wasExpirable = false;
         while (obj == null && l != null && l.size() > 0) {
             obj = l.get(0);
@@ -594,19 +594,19 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         if (obj != null && remove) {
             l.remove(0);
             if (l.size() == 0) {
-                entries.remove(key);
+                this.entries.remove(key);
                 if (wasExpirable)
                     unregisterExpirable(key);
             }
         }
-        entries.replace(key, l);
+        this.entries.replace(key, l);
 
         return obj;
     }
 
     private Object getObject(Template tmpl, boolean remove) {
         Object obj = null;
-        LinkedList<Object> l = entries.get(tmpl.getKey());
+        LinkedList<Object> l = this.entries.get(tmpl.getKey());
         if (l == null)
             return obj;
 
