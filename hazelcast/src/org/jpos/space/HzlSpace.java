@@ -27,8 +27,6 @@ import java.util.Set;
 import java.util.LinkedList;
 import java.util.*;
 import java.io.Serializable;
-import java.lang.Integer.*;
-import java.lang.Long.*;
 
 import com.hazelcast.client.ClientConfig;
 import com.hazelcast.client.HazelcastClient;
@@ -52,12 +50,11 @@ import java.util.concurrent.*;
  * @version $Revision$ $Date$
  */
 
-public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
+public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable, HazelcastInstanceAware{
     private volatile HazelcastInstance instance = null;
-    private volatile HazelcastClient client = null;
-    private DataSerializer serializer = new DataSerializer();
     private String hzlConfigFile;
     private String spaceName;
+    private DataSerializer serializer = new DataSerializer();
     protected Configuration cfg;
     protected Config hzlConfig;
     protected TSpace<K, V> liveObjectSpace = new TSpace<K, V>();
@@ -65,58 +62,34 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     protected HzlSpace sl;    // space listeners
     protected IList<Set> expirables;
     protected ScheduledExecutorService cleanupScheduler;
-    protected ExecutorService executorService;
     public static final long GCDELAY = 60 * 1000;
     private static final long GCLONG = GCDELAY * 5;
     private long lastLongGC = System.currentTimeMillis();
-    public boolean clientOnly = false;
 
 
     public HzlSpace(String spaceName) {
+        super();
         createSpace(spaceName, "");
     }
 
     public HzlSpace(String spaceName, String configFile) {
+        super();
         createSpace(spaceName, configFile);
     }
 
     public HzlSpace(Configuration cfg) {
+        super();
         this.cfg = cfg;
         this.spaceName = cfg.get("space-name", "hzl:DefaultSpace");
-        this.clientOnly = cfg.getBoolean("clientOnly", false);
-        if (this.clientOnly) {
-            createClient(this.cfg);
-        } else {
-            createSpace(spaceName, "");
-        }
+        createSpace(spaceName, "");
     }
 
     public HzlSpace() {
+        super();
         createSpace("hzl:DefaultSpace", "");
     }
 
-    private void createClient(Configuration cfg) {
-        String clusterName = this.cfg.get("clusterName");
-        String clusterPassword = this.cfg.get("clusterPassword");
-        Boolean useShuffle = this.cfg.getBoolean("useShuffle", false);
-        String clusterIPs = this.cfg.get("clusterIPs");
-        GroupConfig groupConf = new GroupConfig();
-        groupConf.setName(clusterName);
-        groupConf.setPassword(clusterPassword);
-
-        ClientConfig clientConf = new ClientConfig();
-        clientConf.setShuffle(useShuffle);
-        clientConf.addAddress(clusterIPs);
-        clientConf.setGroupConfig(groupConf);
-        clientConf.setReconnectionAttemptLimit(5);
-
-        this.client = HazelcastClient.newHazelcastClient(clientConf);
-        this.entries = this.client.getMap(spaceName);
-        this.expirables = this.client.getList(spaceName + "-expirables");
-    }
-
     private void createSpace(String spaceName, String configFile) {
-
         if (configFile != null && !configFile.isEmpty()) {
             this.hzlConfigFile = configFile;
         } else {
@@ -148,8 +121,11 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
 
         this.expirables.add(new HashSet<K>());
         this.expirables.add(new HashSet<K>());
-        this.executorService = this.instance.getExecutorService();
         this.cleanupScheduler = Executors.newScheduledThreadPool(1);
+    }
+
+    public void setHazelcastInstance(HazelcastInstance hazelcastInstance) {
+        this.instance = hazelcastInstance;
     }
 
     public void out(K key, V value) {
@@ -306,80 +282,6 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         return entries.isEmpty();
     }
 
-    protected class DistributedSize<Integer> implements Callable<java.lang.Integer>, Serializable, HazelcastInstanceAware {
-        public Object key;
-        public String entityName;
-        public String entityType;
-        public HazelcastInstance hazelcast;
-
-        public DistributedSize(String entityType, String entityName, Object key) {
-            this.key = key;
-            this.entityName = entityName;
-            this.entityType = entityType;
-        }
-
-        public void setHazelcastInstance(HazelcastInstance hazelcastInstance) {
-            this.hazelcast = hazelcastInstance;
-        }
-
-        public java.lang.Integer call() {
-            int n;
-            n = 0;
-            switch (this.entityType) {
-                case "com.hazelcast.client.MapClientProxy":
-                    IMap map = this.hazelcast.getMap(this.entityName);
-                    if (map != null && this.key != null) {
-                        LinkedList<Object> l = (LinkedList<Object>) map.get(this.key);
-                        if (l != null)
-                            n = l.size();
-                    }
-                    break;
-                case "com.hazelcast.client.ListClientProxy":
-                    IList list = this.hazelcast.getList(this.entityName);
-                    if (list != null && this.key != null) {
-                        Set s = (Set) list.get(java.lang.Integer.parseInt((String) this.key));
-                        if (s != null)
-                            n = s.size();
-                    }
-                    break;
-                default:
-                    n = 0;
-                    break;
-            }
-
-            return n;
-        }
-    }
-
-    public int getDistributedSize(Object entity, Object key) {
-        int size = 0;
-        String entityName;
-        String entityType = entity.getClass().getName();
-        switch (entityType) {
-            case "com.hazelcast.client.MapClientProxy":
-                entityName = ((IMap) entity).getName();
-                break;
-            case "com.hazelcast.client.ListClientProxy":
-                entityName = ((IList) entity).getName();
-                break;
-            default:
-                entityName = null;
-                break;
-        }
-        if(entityName != null && this.executorService != null) {
-            try {
-                Future<Integer> task = this.executorService.submit (new DistributedSize<Integer>(entityType, entityName, key));
-                size = task.get();
-            } catch (InterruptedException e) {
-                //e.printStackTrace();
-            }  catch (ExecutionException e){
-                e.printStackTrace();
-            }
-
-        }
-
-        return size;
-    }
 
     public Set getKeySet() {
         return entries.keySet();
@@ -390,7 +292,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
         Object[] keys;
 
         synchronized (this) {
-            keys = entries.keySet().toArray();
+            keys = this.entries.keySet().toArray();
         }
 
         for (int i = 0; i < keys.length; i++) {
@@ -404,26 +306,17 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     public void dump(PrintStream p, String indent) {
         Object[] keys;
         synchronized (this) {
-            keys = entries.keySet().toArray();
+            keys = this.entries.keySet().toArray();
         }
 
         for (int i = 0; i < keys.length; i++) {
-            if (this.client != null) {
-                p.printf("%s<key count='%d'>%s</key>\n", indent, getDistributedSize(entries, i), keys[i]);
-            } else {
-                p.printf("%s<key count='%d'>%s</key>\n", indent, size(keys[i]), keys[i]);
-            }
+            p.printf("%s<key count='%d'>%s</key>\n", indent, size(keys[i]), keys[i]);
         }
         p.println(indent + "<keycount>" + (keys.length) + "</keycount>");
         long exp0, exp1;
         synchronized (this) {
-            if (this.client != null) {
-                exp0 = getDistributedSize(expirables, 0);
-                exp1 = getDistributedSize(expirables, 1);
-            } else {
-                exp0 = expirables.get(0).size();
-                exp1 = expirables.get(1).size();
-            }
+            exp0 = this.expirables.get(0).size();
+            exp1 = this.expirables.get(1).size();
         }
         p.println(String.format("%s<gcinfo>%d,%d</gcinfo>\n", indent, exp0, exp1));
     }
@@ -628,6 +521,7 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
     protected class ExpirationService implements Serializable, Runnable {
 
         public ExpirationService() {
+            super();
             cleanupScheduler.scheduleAtFixedRate(this, GCDELAY, GCDELAY, TimeUnit.MILLISECONDS);
         }
 
@@ -724,6 +618,27 @@ public class HzlSpace<K, V> implements LocalSpace<K, V>, Loggeable {
                 return -1;
             else
                 return 1;
+        }
+    }
+
+    public class Fibonacci implements Callable<Long>, Serializable {
+        int input = 0;
+
+        public Fibonacci() {
+        }
+
+        public Fibonacci(int input) {
+            this.input = input;
+        }
+
+        public Long call() {
+            return calculate(input);
+        }
+
+        private long calculate (int n) {
+            if (Thread.currentThread().isInterrupted()) return 0;
+            if (n <= 1) return n;
+            else return calculate(n-1) + calculate(n-2);
         }
     }
 }
