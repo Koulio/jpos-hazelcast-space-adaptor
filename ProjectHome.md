@@ -1,0 +1,1 @@
+This project provides a JPOS Q2 Adaptor that allows you to use Hazelcast for a JPOS Space. for More information go to http://www.wired-mind.com/hzlspace.html
